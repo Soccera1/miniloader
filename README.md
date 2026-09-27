@@ -1,176 +1,104 @@
 # MiniLoader
 
-MiniLoader is an x86_64 UEFI application built with GNU-EFI protocol headers
-and a MinGW PE/COFF linker. It has a timed text menu, EFI image loading through
-`LoadImage`/`StartImage`, and Linux EFI-stub initrd handoff through
-`EFI_LOAD_FILE2`.
+MiniLoader is a small x86-64 UEFI boot manager. It shows a timed text menu for
+Linux EFI-stub kernels and other EFI applications. It loads EFI images through
+UEFI and gives Linux its initrd through `EFI_LOAD_FILE2`.
 
-The default build uses firmware Simple File System access. Optional builds can
-also read VFAT, ext2, ext3, ext4, XFS, and Btrfs volumes through UEFI Block I/O. The VFAT
-reader supports FAT12/16/32 and ASCII lookup through VFAT long filenames. The
-ext reader supports classic indirect blocks and ext4 extents, and accepts
-filesystem UUIDs as `fs_uuid`. Unsupported ext features are rejected instead of being
-interpreted as a different layout. Current limits include journal recovery,
-`meta_bg`, encryption, casefold, bigalloc, verity, pending orphan metadata, and
-symbolic links. Metadata checksums are not verified.
-
-The optional XFS reader is ported from GRUB's standalone read-only XFS driver.
-It reads XFS v4 and v5 filesystems, follows symbolic links, and supports inline,
-extent, and btree file mappings. Unsupported incompatibility features and
-volumes marked as needing repair are rejected. It does not replay the XFS log
-or verify v5 metadata checksums. Data blocks are limited to 64 KiB and
-directory blocks to 1 MiB.
-
-The optional Btrfs reader is ported from GRUB's standalone read-only Btrfs
-driver. It reads files from the default filesystem root, including inline and
-regular extents compressed with zlib, LZO, or Zstandard. MiniLoader validates
-the superblock's CRC32C checksum type and checksum; tree blocks are checked for
-their logical address and filesystem UUID, but their metadata checksums and
-file data checksums are not verified. Other Btrfs superblock checksum types
-and unsupported extent encodings or compression types are rejected. Btrfs
-filesystems can be discovered on raw Block I/O devices, unlocked LUKS volumes,
-and LVM logical volumes when those layers are enabled.
-
-An optional LVM2 reader discovers multiple volume groups and maps linear and
-striped logical volumes. It supports at most 16 PVs per VG, 16 VGs, 32 LVs per
-VG, 32 segments per LV, and 8 stripes per segment. It does not support thin,
-snapshot, RAID, mirror, cache, or other non-linear segment types. LVM metadata
-checksums are not verified. Combine it with a filesystem reader to load files
-from logical volumes.
-
-The optional LUKS1 reader supports PBKDF2 with SHA-1, SHA-256, SHA-512,
-RIPEMD160, or Whirlpool, and the AES-XTS-plain64, AES-CBC-ESSIV:sha256,
-Serpent-XTS-plain64, and Twofish-XTS-plain64 profiles. Serpent and Twofish
-are separate build-time options. It prompts for a hidden, printable ASCII
-passphrase (up to 127 bytes) and retries three times. It can read plain LUKS1
-volumes, LUKS1 over LVM, and LUKS1 inside an LVM logical volume. It never
-writes to encrypted storage.
-
-An optional LUKS2 reader supports PBKDF2 with SHA-1, SHA-256, SHA-512,
-RIPEMD160, or Whirlpool, and Argon2id. Argon2 memory use is capped at 1 GiB;
-time cost is capped at 100 and lane count at 32. It supports LUKS1 AF stripes,
-raw selected-cipher key areas, and one AES-CBC-ESSIV:sha256 or AES, Serpent,
-or Twofish XTS data segment with 512-byte or 4096-byte sectors. It validates the metadata checksum and reads
-the newer valid metadata copy. The parser caps metadata at 64 KiB, keyslots at
-32, PBKDF2 iterations at 10 million, and AF material at 256 KiB. Multiple data
-segments and reencryption metadata are rejected. Unsupported layouts and
-parameters are reported; encrypted root storage continues to be unlocked by
-the Linux initramfs.
-
-The optional ZFS reader is ported from GRUB's standalone read-only ZFS driver.
-It reads unencrypted pools with GRUB-compatible read features on disk, mirror,
-and RAID-Z vdevs; supported compression includes LZJB, gzip/zlib, zle,
-LZ4, and Zstandard. MiniLoader checks all four vdev labels, validates pool
-metadata, and rejects unsupported active pool features and encrypted data.
-The pool GUID is exposed as a 16-digit hexadecimal fs_uuid. The host fixture
-checks absent labels, malformed signatures in each label position, and a
-positive read of `fs@/L3F1` from the upstream four-vdev RAID-Z fixture. The
-OVMF ZFS smoke target checks loader boot paths with ZFS enabled and mounts the
-same four-vdev pool through UEFI Block I/O to read that file in firmware.
-A firmware-provided Simple File System driver can also expose FAT volumes.
+The default build uses the firmware's Simple File System protocol, usually for
+the EFI System Partition (ESP). Optional build switches add read-only storage,
+LVM, encryption, and TPM support. MiniLoader only reads storage; the Linux
+initramfs remains responsible for unlocking an encrypted root filesystem.
 
 ## Build
 
-Install GNU-EFI development headers and an x86_64 MinGW cross compiler, then run:
+Install GNU-EFI development headers and an x86-64 MinGW cross compiler, then
+run:
 
 ```sh
+make check-deps
 make
 ```
 
-The output is `build/BOOTX64.EFI`. On installations that keep GNU-EFI headers
-under a different prefix, set `EFI_INCLUDEDIR`, for example:
+The EFI application is `build/BOOTX64.EFI`. If GNU-EFI headers are installed
+outside the default `/usr/include/efi` directory, set `EFI_INCLUDEDIR`:
 
 ```sh
-make EFI_INCLUDEDIR=/usr/include/efi
+make EFI_INCLUDEDIR=/path/to/gnu-efi/include
 ```
 
-To include the custom ext readers, enable the desired filesystems at build
-time. Ext4 mode also reads ext2 and ext3 volumes:
+`make show-features` prints the selected modules. Every optional module below
+defaults to off; combine the switches you need.
 
-```sh
-make ENABLE_FS_EXT2=1 ENABLE_FS_EXT4=1
-```
+| Feature | Build switch |
+| --- | --- |
+| ext2, ext3, ext4 | `ENABLE_FS_EXT2=1`, `ENABLE_FS_EXT4=1` |
+| VFAT | `ENABLE_FS_VFAT=1` |
+| XFS | `ENABLE_FS_XFS=1` |
+| Btrfs | `ENABLE_FS_BTRFS=1` |
+| ZFS | `ENABLE_FS_ZFS=1` |
+| LVM2 | `ENABLE_LVM=1` |
+| LUKS1 / LUKS2 | `ENABLE_LUKS1=1` / `ENABLE_LUKS2=1` |
+| PBKDF2 / Argon2id | `ENABLE_KDF_PBKDF2=1` / `ENABLE_KDF_ARGON2ID=1` |
+| AES-XTS | `ENABLE_CIPHER_AES_XTS=1` |
+| AES-CBC-ESSIV:sha256 | `ENABLE_CIPHER_AES_CBC_ESSIV=1` |
+| Serpent-XTS / Twofish-XTS | `ENABLE_CIPHER_SERPENT_XTS=1` / `ENABLE_CIPHER_TWOFISH_XTS=1` |
+| TPM 1.2 / TPM 2 | `ENABLE_TPM12=1` / `ENABLE_TPM2=1` |
 
-To include the read-only VFAT12/16/32 reader:
-
-```sh
-make ENABLE_FS_VFAT=1
-```
-
-To include the optional read-only XFS reader:
-
-```sh
-make ENABLE_FS_XFS=1
-```
-
-To include the optional read-only Btrfs reader:
-
-```sh
-make ENABLE_FS_BTRFS=1
-```
-
-To load an ext4 filesystem from an LVM linear or striped logical volume:
+For example, build an ext4 reader with LVM support:
 
 ```sh
 make ENABLE_FS_EXT4=1 ENABLE_LVM=1
 ```
 
-To enable LUKS1 with ext4 and optional LVM discovery:
+LUKS1 requires PBKDF2 and at least one cipher. LUKS2 requires at least one
+KDF and one cipher. Argon2id and TPM 2 require LUKS2; TPM 1.2 requires LUKS1.
+These examples enable AES-XTS:
 
 ```sh
 make ENABLE_FS_EXT4=1 ENABLE_LVM=1 ENABLE_LUKS1=1 \
     ENABLE_KDF_PBKDF2=1 ENABLE_CIPHER_AES_XTS=1
-```
 
-To enable LUKS2 PBKDF2 and Argon2id volumes with ext4 and optional LVM discovery:
-
-```sh
 make ENABLE_FS_EXT4=1 ENABLE_LVM=1 ENABLE_LUKS2=1 \
-    ENABLE_KDF_PBKDF2=1 ENABLE_KDF_ARGON2ID=1 ENABLE_CIPHER_AES_XTS=1
+    ENABLE_KDF_PBKDF2=1 ENABLE_KDF_ARGON2ID=1 \
+    ENABLE_CIPHER_AES_XTS=1
 ```
 
-LUKS1 requires PBKDF2 and at least one enabled cipher profile. LUKS2 requires
-at least one of PBKDF2 or Argon2id and at least one enabled cipher profile. Add
-`ENABLE_CIPHER_SERPENT_XTS=1` and/or `ENABLE_CIPHER_TWOFISH_XTS=1` to include
-those optional implementations. LUKS2 keyslots and data segments can use any
-enabled XTS cipher. Config discovery prompts for encrypted candidates so it
-can check for a unique
-`/boot/miniloader.conf` across all readable volumes.
+To include TPM 2 unsealing in that LUKS2 build, add `ENABLE_TPM2=1`. For TPM
+1.2, add `ENABLE_TPM12=1` to the LUKS1 build. Builds with LUKS2 can enable
+`ENABLE_CIPHER_AES_CBC_ESSIV=1`, `ENABLE_CIPHER_SERPENT_XTS=1`, and
+`ENABLE_CIPHER_TWOFISH_XTS=1` for those additional profiles.
 
-Firmware TPM2 unsealing for systemd-compatible LUKS2 tokens is an additional
-build option. It requires LUKS2 support and uses the UEFI TCG2 command
-interface; no TPM userspace library is linked into the EFI image:
+## Install and boot
+
+Mount the ESP and copy the application to a path on it. For example:
 
 ```sh
-make ENABLE_FS_EXT4=1 ENABLE_LUKS2=1 ENABLE_KDF_PBKDF2=1 \
-    ENABLE_CIPHER_AES_XTS=1 ENABLE_TPM2=1
+sudo install -D build/BOOTX64.EFI /mnt/esp/EFI/MiniLoader/BOOTX64.EFI
 ```
 
-MiniLoader tries a matching token before showing the LUKS2 passphrase prompt.
-An unavailable TPM, an unsupported token, or a PCR policy mismatch falls back
-to that prompt. It supports SHA-1 and SHA-256 PCR banks and ECC or RSA primary
-keys. PIN-protected tokens are not supported.
+Then configure the UEFI boot manager to start `\EFI\MiniLoader\BOOTX64.EFI`,
+or select MiniLoader from the firmware's boot menu. The fallback path is
+`\EFI\BOOT\BOOTX64.EFI`; firmware may use it when no earlier boot entry takes
+precedence.
 
-TPM 1.2 unsealing for LUKS1 sidecars is optional as well. It requires LUKS1
-support and uses the UEFI EFI_TCG pass-through interface:
-
-```sh
-make ENABLE_LUKS1=1 ENABLE_KDF_PBKDF2=1 \
-    ENABLE_CIPHER_AES_XTS=1 ENABLE_TPM12=1
-```
-
-`make show-features` reports selected reader modules. The default image omits
-custom filesystem, LVM, and crypto code.
+When booting a disk with OVMF, the OVMF variable store controls the boot order.
+An existing entry can still start a Linux EFI-stub directly, even when
+MiniLoader is installed on the disk. Select or prioritize the MiniLoader boot
+entry in OVMF. No QEMU `-kernel` option is needed: `-kernel` bypasses the usual
+UEFI application boot path.
 
 ## Configuration
 
-Place `/boot/miniloader.conf` on exactly one enabled read-only volume.
-Configuration is ASCII INI-style text with comments starting with `#` or `;`.
-Each entry has a section name, a `type`, and `fs_uuid`. For a firmware Simple
-File System volume, `fs_uuid` is its GPT partition GUID in canonical form. For
-ext2/3/4 it is the filesystem UUID. The `partuuid:` prefix can select an ext
-volume by GPT partition GUID. The aliases `boot` and `*` select the volume
-containing the unique configuration file.
+Put `/boot/miniloader.conf` on exactly one volume MiniLoader can read. At
+startup, MiniLoader searches the volume it was loaded from first, then other
+enabled volumes. It refuses to boot if the file is missing or found more than
+once. Encrypted candidates use the configured TPM flow first, then prompt for
+a passphrase when needed.
+
+The file is ASCII INI-style text. Global keys are `timeout` and `default`;
+comments start with `#` or `;`. Every named entry needs `type` and `fs_uuid`.
+Linux entries also need `kernel`, `initrd`, and `cmdline`. EFI entries need
+`path`.
 
 ```ini
 timeout=5
@@ -178,7 +106,7 @@ default=linux
 
 [linux]
 type=linux
-fs_uuid=01234567-89ab-cdef-0123-456789abcdef
+fs_uuid=boot
 kernel=\EFI\Linux\vmlinuz.efi
 initrd=\EFI\Linux\initrd.img
 cmdline=root=UUID=11111111-2222-3333-4444-555555555555 ro quiet
@@ -189,72 +117,129 @@ fs_uuid=boot
 path=\EFI\Tools\setup.efi
 ```
 
-Linux entries require `kernel`, `initrd`, and `cmdline`. EFI entries require
-`path`. Paths may use either slash style. The parser rejects unknown keys,
-duplicate keys, malformed sections, missing fields, an unknown default entry,
-and files over 64 KiB. The menu timeout defaults to five seconds; `timeout=0`
-boots the selected default immediately.
+Use the volume identifier understood by its reader: for a firmware Simple File
+System volume, `fs_uuid` is its GPT partition GUID in canonical form; for ext
+volumes, it is the filesystem UUID. The `partuuid:<GUID>` form selects an ext
+volume by GPT partition GUID. ZFS uses its pool GUID as a 16-digit hexadecimal
+identifier. The aliases `boot` and `*` select the volume containing the unique
+configuration file. Paths may use either slash style.
 
-The UEFI file API and Block I/O protocol are only used in read mode. Encrypted
-root storage continues to be unlocked by Linux initramfs.
+The menu defaults to five seconds and the first entry. `timeout=0` boots the
+default immediately; values may be from 0 to 3600 seconds. The parser rejects
+unknown or duplicate keys, malformed entries, missing fields, unknown defaults,
+and files larger than 64 KiB.
 
-## Enrollment helper
+## Storage support and limits
 
-`tools/miniloader-enroll` wraps `systemd-cryptenroll` for TPM2 tokens on LUKS2
-volumes:
+Firmware Simple File System access is always available. The following readers
+are included only when enabled at build time.
+
+### VFAT
+
+Reads FAT12/16/32 volumes, with ASCII lookup including VFAT long-name records.
+
+### ext2/3/4
+
+Reads classic indirect blocks and ext4 extents. Ext4 mode also reads ext2 and
+ext3. Unsupported features are rejected, including journal recovery, `meta_bg`,
+encryption, casefold, bigalloc, verity, pending orphan metadata, and symbolic
+links. Metadata checksums are not verified.
+
+### XFS
+
+Reads XFS v4/v5, inline, extent, and btree file mappings, and symbolic links.
+Volumes needing repair and unsupported incompatibility features are rejected.
+MiniLoader does not replay the log or verify v5 metadata checksums. Data blocks
+are limited to 64 KiB and directory blocks to 1 MiB.
+
+### Btrfs
+
+Reads the default filesystem root, including inline and regular extents
+compressed with zlib, LZO, or Zstandard. The superblock CRC32C is checked;
+tree-block addresses and filesystem UUIDs are checked. Tree and file-data
+checksums are not verified. Unsupported checksum types, extent encodings, and
+compression types are rejected.
+
+### ZFS
+
+Reads unencrypted pools with supported GRUB-compatible on-disk features on
+disk, mirror, and RAID-Z vdevs. Compression support includes LZJB, gzip/zlib,
+zle, LZ4, and Zstandard. MiniLoader checks all four vdev labels and pool
+metadata, and rejects unsupported active features and encrypted data.
+
+### LVM2
+
+Maps linear and striped logical volumes only. Each VG can contain up to 16 PVs
+and 32 LVs; each LV can have up to 32 segments, with up to 8 stripes per
+segment. Thin, snapshot, RAID, mirror, cache, and other segment types are
+unsupported. LVM metadata checksums are not verified.
+
+LUKS readers support PBKDF2 with SHA-1, SHA-256, SHA-512, RIPEMD160, or
+Whirlpool. LUKS2 also supports Argon2id, capped at 1 GiB of memory, time cost
+100, and 32 lanes. LUKS2 metadata is checksum-validated; metadata is limited
+to 64 KiB, keyslots to 32, PBKDF2 iterations to 10 million, and AF material to
+256 KiB. Multiple data segments and reencryption metadata are unsupported.
+
+Supported cipher profiles are AES-XTS-plain64, AES-CBC-ESSIV:sha256,
+Serpent-XTS-plain64, and Twofish-XTS-plain64, subject to build switches. LUKS2
+supports one data segment with 512-byte or 4096-byte sectors. LUKS1 accepts
+hidden printable-ASCII passphrases up to 127 bytes and retries three times.
+Unsupported ciphers, KDF settings, and layouts produce an error. Storage
+layering supports both LUKS → LVM → filesystem and LVM → LUKS → filesystem,
+as well as unencrypted filesystems and LVM volumes.
+
+## TPM enrollment
+
+`tools/miniloader-enroll` creates systemd-compatible TPM 2 tokens for LUKS2 or
+UUID-linked sidecars for TPM 1.2 and LUKS1. Run it as root and provide the PCR
+indices to bind enrollment to:
 
 ```sh
 sudo tools/miniloader-enroll add --device /dev/nvme0n1p3 --tpm 2 --pcrs 7
 sudo tools/miniloader-enroll remove --device /dev/nvme0n1p3 --tpm 2
 ```
 
-TPM2 enrollment delegates passphrase prompting and token creation to
-`systemd-cryptenroll`; a TPM or PCR failure is handled by the Linux initramfs
-unlock flow. PCR lists may be comma or plus separated; the helper passes the
-plus-separated format expected by systemd. `remove` clears systemd TPM2 token
-slots on that device.
+PCR lists accept commas or plus signs. TPM 2 enrollment delegates to
+`systemd-cryptenroll`; MiniLoader supports SHA-1 and SHA-256 PCR banks and ECC
+or RSA primary keys. PIN-protected tokens are unsupported. If TPM access,
+token parsing, or PCR validation fails, MiniLoader asks for the LUKS
+passphrase.
 
-For TPM 1.2 and LUKS1, `add` prompts for the LUKS passphrase and uses
-TrouSerS `tpm_sealdata` to seal it to the selected PCRs. Enrollment uses the
-TPM's well-known SRK secret so firmware can load the sealed key without a
-second interactive secret. The default UUID-linked sidecar is
+For TPM 1.2, `add` prompts for the LUKS passphrase and uses TrouSerS
+`tpm_sealdata` to seal it to the selected PCRs. The default sidecar path is
 `/boot/miniloader/tpm12/<LUKS-UUID>.json`; use `--metadata-dir` to place it on
-the unencrypted boot filesystem MiniLoader can read. `remove` deletes the
-sidecar for that LUKS UUID. Builds with `ENABLE_TPM12=1` and `ENABLE_LUKS1=1`
-read that envelope through the UEFI EFI_TCG protocol. TPM unseal or PCR
-failures fall back to the LUKS1 passphrase prompt. TPM2 tokens can be used by
-firmware builds with `ENABLE_TPM2=1` as described above.
+an unencrypted volume MiniLoader can read. `remove` deletes that sidecar. TPM
+1.2 builds use the UEFI `EFI_TCG` interface; TPM 2 builds use the UEFI TCG2
+command interface.
 
-## Verification
+## Tests and QEMU
 
-Run parser, block/GPT, VFAT, XFS, Btrfs image, ZFS absent/malformed-label and
-positive RAID-Z file-read,
-LVM linear/striped, ext filesystem image, LUKS1, LUKS2, cryptographic primitive,
-TPM 1.2 envelope/authorization, and enrollment helper checks with `make test`.
-The TPM 1.2 software-transport test checks OIAP authorization HMACs, malformed
-sidecars, unavailable TPMs, and PCR mismatch fallback. When `swtpm` and TSS2 development
-libraries are installed, this also exercises ECC and RSA systemd-style tokens,
-SHA-1/SHA-256 PCR policy handling, and PCR mismatch fallback. Run
-`make qemu-ovmf-tpm2-smoke` to verify OVMF's TCG2 command interface with
-`swtpm`, and `make qemu-ovmf-tpm12-smoke` to check OVMF's EFI_TCG pass-through
-interface with a TPM 1.2 `swtpm`. Run the general QEMU/OVMF smoke path with
-`make qemu-ovmf-smoke`. Run
-`make qemu-ovmf-vfat-smoke` to repeat the menu checks with VFAT block discovery
-enabled. Run `make qemu-ovmf-xfs-smoke` to boot the EFI child and initrd from a
-populated XFS partition. Run `make qemu-ovmf-btrfs-smoke` to boot those files
-from a generated Btrfs filesystem. Run `make qemu-ovmf-zfs-smoke` to launch
-the ZFS-enabled image under OVMF and read a file from a RAID-Z pool through
-UEFI Block I/O. With `mkfs.xfs` and `mke2fs`
-and `sgdisk` installed, run
-`make qemu-ovmf-ext-smoke` to boot an EFI child and initrd from a GPT ext4
-partition through UEFI Block I/O. Run `make qemu-ovmf-lvm-smoke` to boot those
-files from an ext4 filesystem on a linear LVM logical volume. Run
-`make qemu-ovmf-luks1-smoke` to type a test passphrase through QMP and verify
-config, EFI image, and initrd reads from AES-XTS, Serpent-XTS, Twofish-XTS,
-and AES-CBC-ESSIV LUKS1,
-LUKS1-over-LVM, and LVM-over-LUKS1 ext4 volumes. Set `OVMF_CODE` and
-`OVMF_VARS` if your firmware files are in a different directory. The LUKS1
-OVMF target also needs Python `cryptography` to prepare a CBC-ESSIV disk image.
-Run `make qemu-ovmf-luks2-smoke` to boot from PBKDF2, Argon2id, AES-XTS,
-AES-CBC-ESSIV, Serpent-XTS, and Twofish-XTS LUKS2 volumes, plus LUKS2-over-LVM and
-LVM-over-LUKS2 ext4 volumes. Secure Boot is outside this implementation.
+Run the host-side parser, filesystem, block-device, LVM, LUKS, crypto, TPM, and
+enrollment checks with:
+
+```sh
+make test
+```
+
+The QEMU/OVMF smoke targets exercise the UEFI boot path. OVMF firmware and the
+relevant host utilities are required; set `OVMF_CODE` and `OVMF_VARS` if the
+firmware files are not in the default locations.
+
+- `make qemu-ovmf-smoke` — menu, missing/duplicate config handling, and
+  EFI/initrd handoff.
+- `make qemu-ovmf-vfat-smoke` — menu and config discovery with VFAT enabled.
+- `make qemu-ovmf-ext-smoke`, `make qemu-ovmf-xfs-smoke`, and
+  `make qemu-ovmf-btrfs-smoke` — EFI image and initrd reads from ext4, XFS, or
+  Btrfs.
+- `make qemu-ovmf-zfs-smoke` and `make qemu-ovmf-zfs-read-smoke` — ZFS boot
+  path and file reads through UEFI Block I/O.
+- `make qemu-ovmf-lvm-smoke` — EFI image and initrd reads from ext4 on a
+  linear LVM volume.
+- `make qemu-ovmf-luks1-smoke` — LUKS1 cipher profiles and both LUKS/LVM layer
+  orders.
+- `make qemu-ovmf-luks2-smoke` — LUKS2 KDF/cipher profiles and both LUKS/LVM
+  layer orders.
+- `make qemu-ovmf-tpm2-smoke` and `make qemu-ovmf-tpm12-smoke` — TPM 2 TCG2
+  and TPM 1.2 EFI_TCG paths using `swtpm`.
+
+Secure Boot is outside the current scope.
