@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Enroll or remove TPM-backed LUKS unlock metadata for MiniLoader."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import getpass
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import uuid
+from pathlib import Path
+from typing import Sequence
+
+
+class EnrollError(Exception):
+    pass
+
+
+DEFAULT_TPM12_METADATA_DIR = "/boot/miniloader/tpm12"
+
+
+def normalize_pcrs(value: str) -> str:
+    parts = value.replace(",", "+").split("+")
+    if not parts or any(not part for part in parts):
+        raise EnrollError("PCR list must be a comma-separated list of numbers from 0 to 23")
+    parsed: list[int] = []
+    for part in parts:
+        if not part.isascii() or not part.isdecimal():
+            raise EnrollError(f"invalid PCR index: {part!r}")
+        pcr = int(part)
+        if pcr > 23:
+            raise EnrollError(f"PCR index {pcr} is outside the TPM PCR range 0..23")
+        if pcr in parsed:
+            raise EnrollError(f"PCR index {pcr} appears more than once")
+        parsed.append(pcr)
+    return "+".join(str(pcr) for pcr in parsed)
+
+
+def luks_version(device: str) -> int:
+    cryptsetup = shutil.which("cryptsetup")
+    if not cryptsetup:
+        raise EnrollError("cryptsetup is required to inspect the target volume")
+    try:
+        result = subprocess.run(
+            [cryptsetup, "luksDump", device], check=True, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.strip() or "cryptsetup could not read the LUKS header"
+        raise EnrollError(detail) from exc
+    match = re.search(r"^Version:\s*([12])\s*$", result.stdout, re.MULTILINE)
+    if not match:
+        raise EnrollError("target is not a supported LUKS1 or LUKS2 device")
+    return int(match.group(1))
+
+
+def luks_uuid(device: str) -> str:
+    cryptsetup = shutil.which("cryptsetup")
+    if not cryptsetup:
+        raise EnrollError("cryptsetup is required to inspect the target volume")
+    try:
+        result = subprocess.run(
+            [cryptsetup, "luksUUID", device], check=True, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.strip() or "cryptsetup could not read the LUKS UUID"
+        raise EnrollError(detail) from exc
+    try:
+        return str(uuid.UUID(result.stdout.strip()))
+    except ValueError as exc:
+        raise EnrollError("cryptsetup returned an invalid LUKS UUID") from exc
+
+
+def tpm12_metadata_path(args: argparse.Namespace, device_uuid: str) -> Path:
+    return Path(args.metadata_dir) / f"{device_uuid}.json"
+
+
+def tpm12_seal_command(tool: str, input_path: Path, output_path: Path,
+                       pcrs: str) -> list[str]:
+    command = [tool, "--well-known", "--infile", str(input_path),
+               "--outfile", str(output_path)]
+    for pcr in pcrs.split("+"):
+        command.extend(("--pcr", pcr))
+    return command
+
+
+def add_tpm12(args: argparse.Namespace) -> None:
+    normalized_device = os.path.realpath(args.device)
+    if luks_version(normalized_device) != 1:
+        raise EnrollError("TPM 1.2 MiniLoader metadata is only available for LUKS1")
+    pcrs = normalize_pcrs(args.pcrs)
+    device_uuid = luks_uuid(normalized_device)
+    tool = shutil.which("tpm_sealdata")
+    if not tool:
+        raise EnrollError("tpm_sealdata from TrouSerS tpm-tools is required for TPM 1.2 enrollment")
+    secret = getpass.getpass(f"LUKS1 passphrase for {normalized_device}: ")
+    if not secret:
+        raise EnrollError("LUKS1 passphrase cannot be empty")
+    try:
+        encoded_secret = secret.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise EnrollError("TPM 1.2 enrollment requires a printable ASCII passphrase") from exc
+    if len(encoded_secret) > 127 or any(byte < 0x20 or byte > 0x7e for byte in encoded_secret):
+        raise EnrollError("TPM 1.2 enrollment supports printable ASCII passphrases up to 127 bytes")
+
+    metadata_dir = Path(args.metadata_dir)
+    created_metadata_dir = not metadata_dir.exists()
+    metadata_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not metadata_dir.is_dir():
+        raise EnrollError(f"TPM 1.2 metadata path is not a directory: {metadata_dir}")
+    if created_metadata_dir:
+        os.chmod(metadata_dir, 0o700)
+    final_path = tpm12_metadata_path(args, device_uuid)
+    temp_root = "/run" if os.path.isdir("/run") and os.access("/run", os.W_OK) else None
+    with tempfile.TemporaryDirectory(prefix="miniloader-tpm12-", dir=temp_root) as temporary:
+        temporary_dir = Path(temporary)
+        input_path = temporary_dir / "luks-passphrase"
+        output_path = temporary_dir / "sealed-passphrase"
+        input_path.write_bytes(encoded_secret)
+        os.chmod(input_path, 0o600)
+        try:
+            subprocess.run(
+                tpm12_seal_command(tool, input_path, output_path, pcrs),
+                check=True,
+            )
+            sealed = output_path.read_bytes()
+        except subprocess.CalledProcessError as exc:
+            raise EnrollError(
+                f"tpm_sealdata failed with status {exc.returncode}"
+            ) from exc
+        finally:
+            secret = ""
+            try:
+                input_path.write_bytes(bytes(input_path.stat().st_size))
+            except OSError:
+                pass
+        if not sealed:
+            raise EnrollError("tpm_sealdata produced an empty sealed blob")
+        document = {
+            "format": "miniloader-tpm12-v1",
+            "luks_uuid": device_uuid,
+            "pcrs": [int(pcr) for pcr in pcrs.split("+")],
+            "sealed_blob": base64.b64encode(sealed).decode("ascii"),
+        }
+        descriptor, temporary_metadata_name = tempfile.mkstemp(
+            prefix=f".{final_path.name}.", suffix=".tmp", dir=metadata_dir
+        )
+        temporary_metadata = Path(temporary_metadata_name)
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="ascii") as output:
+                json.dump(document, output, separators=(",", ":"))
+                output.write("\n")
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary_metadata, final_path)
+        except Exception:
+            try:
+                temporary_metadata.unlink()
+            except OSError:
+                pass
+            raise
+    print(f"Wrote TPM 1.2 metadata to {final_path}")
+
+
+def remove_tpm12(args: argparse.Namespace) -> None:
+    normalized_device = os.path.realpath(args.device)
+    if luks_version(normalized_device) != 1:
+        raise EnrollError("TPM 1.2 MiniLoader metadata is only available for LUKS1")
+    device_uuid = luks_uuid(normalized_device)
+    metadata = tpm12_metadata_path(args, device_uuid)
+    try:
+        metadata.unlink()
+    except FileNotFoundError:
+        raise EnrollError(f"no TPM 1.2 metadata found for LUKS UUID {device_uuid}")
+    print(f"Removed TPM 1.2 metadata {metadata}")
+
+
+def command_for(args: argparse.Namespace) -> list[str]:
+    normalized_device = os.path.realpath(args.device)
+    if args.action == "add":
+        pcrs = normalize_pcrs(args.pcrs)
+        version = luks_version(normalized_device)
+        if args.tpm == "1.2":
+            if version != 1:
+                raise EnrollError("TPM 1.2 enrollment in MiniLoader metadata is only available for LUKS1")
+            raise EnrollError("use add_tpm12() to create the TPM 1.2 sidecar")
+        if version != 2:
+            raise EnrollError("systemd TPM2 tokens require a LUKS2 volume")
+        tool = shutil.which("systemd-cryptenroll")
+        if not tool:
+            raise EnrollError("systemd-cryptenroll is required for TPM2 enrollment")
+        return [tool, "--tpm2-device=auto", f"--tpm2-pcrs={pcrs}", normalized_device]
+
+    if args.tpm == "1.2":
+        raise EnrollError("use remove_tpm12() to delete the TPM 1.2 sidecar")
+    if luks_version(normalized_device) != 2:
+        raise EnrollError("systemd TPM2 tokens require a LUKS2 volume")
+    tool = shutil.which("systemd-cryptenroll")
+    if not tool:
+        raise EnrollError("systemd-cryptenroll is required to remove TPM2 enrollment")
+    return [tool, "--wipe-slot=tpm2", normalized_device]
+
+
+def make_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="miniloader-enroll",
+        description="Manage TPM 1.2 metadata and systemd-compatible TPM2 tokens for MiniLoader.",
+    )
+    subparsers = parser.add_subparsers(dest="action", required=True)
+    add = subparsers.add_parser("add", help="enroll TPM 1.2/LUKS1 or TPM2/LUKS2 unlock data")
+    add.add_argument("--device", required=True, help="LUKS block device")
+    add.add_argument("--tpm", required=True, choices=("1.2", "2"))
+    add.add_argument("--pcrs", required=True, help="PCR indices separated by commas or plus signs, such as 7 or 0,2,7")
+    add.add_argument("--metadata-dir", default=DEFAULT_TPM12_METADATA_DIR,
+                     help=f"TPM 1.2 sidecar directory (default: {DEFAULT_TPM12_METADATA_DIR})")
+    remove = subparsers.add_parser("remove", help="remove TPM 1.2/LUKS1 metadata or TPM2/LUKS2 tokens")
+    remove.add_argument("--device", required=True, help="LUKS block device")
+    remove.add_argument("--tpm", required=True, choices=("1.2", "2"))
+    remove.add_argument("--metadata-dir", default=DEFAULT_TPM12_METADATA_DIR,
+                         help=f"TPM 1.2 sidecar directory (default: {DEFAULT_TPM12_METADATA_DIR})")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = make_parser().parse_args(argv)
+    if not os.path.exists(args.device):
+        print(f"miniloader-enroll: device does not exist: {args.device}", file=sys.stderr)
+        return 2
+    if os.geteuid() != 0:
+        print("miniloader-enroll: run as root to modify a LUKS volume", file=sys.stderr)
+        return 2
+    try:
+        if args.tpm == "1.2":
+            if args.action == "add":
+                add_tpm12(args)
+            else:
+                remove_tpm12(args)
+        else:
+            command = command_for(args)
+            subprocess.run(command, check=True)
+    except EnrollError as exc:
+        print(f"miniloader-enroll: {exc}", file=sys.stderr)
+        return 2
+    except subprocess.CalledProcessError as exc:
+        print(f"miniloader-enroll: enrollment command failed with status {exc.returncode}", file=sys.stderr)
+        return exc.returncode or 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
